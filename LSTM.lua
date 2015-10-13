@@ -1,5 +1,6 @@
 -- This LSTM is based on Adam Paszke's tutorial http://apaszke.github.io/lstm-explained.html
 -- Encapsulation of forward, backward, and cell creation are based on StanfordNLP's TreeLSTM
+-- https://github.com/stanfordnlp/treelstm/blob/master/models/LSTM.lua
 -- Author: NorThanapon
 -- Date: Oct 07, 2015
 
@@ -11,7 +12,7 @@ local LSTM, parent = torch.class('lstm.LSTM', 'nn.Module')
 ---- input_dim: #dimensions of the input
 ---- hidden_dim: #dimensions of the hidden state and cell state
 -- TODO:
----- Allow each cell can be multi-layer network
+---- Allow each cell to be multi-layer network
 ---- Optimize for forward only mode (don't keep rolled-out cells)
 function LSTM:__init(config)
     parent.__init(self)
