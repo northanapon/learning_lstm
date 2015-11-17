@@ -5,20 +5,21 @@
 -- Date: Oct 07, 2015
 
 -- Input: A tensor containing sequence of inputs (input_dim X T)
--- Output: A table containing all cell and hidden states in the sequence {hidden_dim, hidden_dim} X T
+-- Output: A table containing all hidden states in the sequence (hidden_dim X num_layers X T)
 local LSTM, parent = torch.class('lstm.LSTM', 'nn.Module')
 
 -- Construct LSTM with
+---- num_layers: #hidden layers
 ---- input_dim: #dimensions of the input
 ---- hidden_dim: #dimensions of the hidden state and cell state
 -- TODO:
----- Allow each cell to be multi-layer network
 ---- Optimize for forward only mode (don't keep rolled-out cells)
 function LSTM:__init(config)
     parent.__init(self)
     -- setting hyper-params
     self.input_dim = config.input_dim
     self.hidden_dim = config.hidden_dim
+    self.num_layers = config.num_layers
     
     -- create master cell (all cells will share master cell's params)
     self.master_cell = self:new_cell()
@@ -29,13 +30,23 @@ function LSTM:__init(config)
     
     -- Setting initial values
     local c_init, h_init, c_grad, h_grad
-    c_init = torch.zeros(self.hidden_dim)
-    h_init = torch.zeros(self.hidden_dim)
-    c_grad = torch.zeros(self.hidden_dim)
-    h_grad = torch.zeros(self.hidden_dim)
+    if self.num_layers == 1 then
+        c_init = torch.zeros(self.hidden_dim)
+        h_init = torch.zeros(self.hidden_dim)
+        c_grad = {torch.zeros(self.hidden_dim)}
+        h_grad = {torch.zeros(self.hidden_dim)}
+    else
+        c_init, h_init, c_grad, h_grad = {}, {}, {}, {}
+        for l = 1,self.num_layers do
+            c_init[l] = torch.zeros(self.hidden_dim)
+            h_init[l] = torch.zeros(self.hidden_dim)
+            c_grad[l] = torch.zeros(self.hidden_dim)
+            h_grad[l] = torch.zeros(self.hidden_dim)
+        end
+    end
     self.init_values = {c_init, h_init}
-    -- gradInput for backward prob
-    self.gradInput = {
+    -- grad_input for backward prob
+    self.grad_input = {
         torch.zeros(self.input_dim),
         c_grad,
         h_grad
@@ -43,43 +54,51 @@ function LSTM:__init(config)
 end
     
 function LSTM:new_cell()
-    local inputs = {} -- {x_t, c_{t-1}, h_{t-1}}
-    table.insert(inputs, nn.Identity()())
-    table.insert(inputs, nn.Identity()())
-    table.insert(inputs, nn.Identity()())
-    local input = inputs[1]
-    local c_p = inputs[2]
-    local h_p = inputs[3]
-    local i2h = nn.Linear(self.input_dim, 4*self.hidden_dim)(input) -- W_x * x_t + b_x
-    local h2h = nn.Linear(self.hidden_dim, 4*self.hidden_dim)(h_p) -- W_h * h_{t-1} + b_h
-    -- preactivations for i_t, f_t, o_t, c_in_t (update)
-    local preacts = nn.CAddTable()({i2h, h2h}) -- i2h + h2h
-    -- direction of Narrow = 1 (column vector input)
-    -- nonlinear:
-    --     input, forget, and output gates get Sigmoid
-    --     state update gets Tanh
-    local all_gates = nn.Sigmoid()(nn.Narrow(1, 1, 3*self.hidden_dim)(preacts)) 
-    local update = nn.Tanh()(nn.Narrow(1, 3*self.hidden_dim + 1, self.hidden_dim)(preacts))
-    -- split gates into their variables
-    local i_gate = nn.Narrow(1, 1, self.hidden_dim)(all_gates)
-    local f_gate = nn.Narrow(1, self.hidden_dim + 1, self.hidden_dim)(all_gates)
-    local o_gate = nn.Narrow(1, 2 * self.hidden_dim + 1, self.hidden_dim)(all_gates)
-    -- new state, c = f_t .* c_p + i_t .* c_in_t
-    local c = nn.CAddTable()({
-            nn.CMulTable()({f_gate, c_p}),
-            nn.CMulTable()({i_gate, update})
-        })
-    -- new hidden, h = o_t .* Tanh(c)
-    local h = nn.CMulTable()({
-            o_gate,
-            nn.Tanh()(c)
-        })
-    -- output new state c, and new hidden h
-    local outputs = {}
-    table.insert(outputs, c)
-    table.insert(outputs, h)
-    local cell = nn.gModule(inputs, outputs)
+    local input = nn.Identity()()
+    local c_p = nn.Identity()()
+    local h_p = nn.Identity()()
+    local inputs = {input, c_p, h_p} -- {x_t, c_{t-1}, h_{t-1}}
+    local h, c = {}, {}
     
+    for l = 1, self.num_layers do
+        local c_l_p = nn.SelectTable(l)(c_p) -- c_{t-1}{l}
+        local h_l_p = nn.SelectTable(l)(h_p) -- h_{t-1}{l}
+        local i2h
+        if l == 1 then
+            i2h = nn.Linear(self.input_dim, 4*self.hidden_dim)(input) -- W_x * x_t + b_x
+        else
+            i2h = nn.Linear(self.hidden_dim, 4*self.hidden_dim)(h[l-1]) -- W_x * h_{t}{l-1} + b_x
+        end
+        local h2h = nn.Linear(self.hidden_dim, 4*self.hidden_dim)(h_l_p) -- W_h * h_{t-1}{l} + b_h  
+        -- preactivations for i_t, f_t, o_t, c_in_t (update)
+        local preacts = nn.CAddTable()({i2h, h2h}) -- i2h + h2h
+    
+        -- direction of Narrow = 1 (column vector input)
+        -- nonlinear:
+        --     input, forget, and output gates get Sigmoid
+        --     state update gets Tanh
+        local all_gates = nn.Sigmoid()(nn.Narrow(1, 1, 3*self.hidden_dim)(preacts)) 
+        local update = nn.Tanh()(nn.Narrow(1, 3*self.hidden_dim + 1, self.hidden_dim)(preacts))
+        -- split gates into their variables
+        local i_gate = nn.Narrow(1, 1, self.hidden_dim)(all_gates)
+        local f_gate = nn.Narrow(1, self.hidden_dim + 1, self.hidden_dim)(all_gates)
+        local o_gate = nn.Narrow(1, 2 * self.hidden_dim + 1, self.hidden_dim)(all_gates)
+        -- new state, c_{t}{l} = f_t .* c_{t-1}{l} + i_t .* c_in_t
+        c[l] = nn.CAddTable()({
+                nn.CMulTable()({f_gate, c_l_p}),
+                nn.CMulTable()({i_gate, update})
+            })
+        -- new hidden, h_{t}{l} = o_t .* Tanh(c)
+        h[l] = nn.CMulTable()({
+                o_gate,
+                nn.Tanh()(c[l])
+            })
+    end
+    -- output new state c, and new hidden h
+    -- c and h are a table. the output will have the size of 2 x num_layers
+    -- c = outputs[1], h = outputs[2] 
+    local outputs = {nn.Identity()(c), nn.Identity()(h)} 
+    local cell = nn.gModule(inputs, outputs)
     -- It is important that all cells share the same set of params (same pointer)
     if self.master_cell then
         lstm.utils.share_parameters(self.master_cell, cell)
@@ -88,10 +107,10 @@ function LSTM:new_cell()
 end
 
 -- inputs: input_dim x T
--- outputs: {hidden_dim, hidden_dim} X T (cell state, and hidden state)
+-- outputs: hidden_dim X num_layers X T
 function LSTM:forward(inputs)
     local size = inputs:size(2)
-    local out_stats = {}
+    local out_states = torch.Tensor(self.hidden_dim, self.num_layers, size)
     for t = 1, size do
         -- set up input and depth
         local input = inputs[{{},t}]
@@ -109,17 +128,31 @@ function LSTM:forward(inputs)
         else
             prev_output = self.init_values
         end
+        -- in case of 1 layer, the cell will output 2 tensors of c and h
+        -- instead of 2 tables of tensors, so we need to wrap the table for c and h
+        prev_c = prev_output[1]
+        prev_h = prev_output[2]
+        if self.num_layers == 1 then
+            prev_c = {prev_c}
+            prev_h = {prev_h}
+        end
         -- forward prop
-        local outputs = cell:forward({input, prev_output[1], prev_output[2]})        
+        local outputs = cell:forward({input, prev_c, prev_h})        
         -- output
         self.output = outputs
-        out_stats[t] = outputs
+        if self.num_layers == 1 then
+            out_states[{{},{},t}] = outputs[2]
+        else
+            for i=1,self.num_layers do
+                out_states[{{}, i, t}] = outputs[2][i]
+            end
+        end
     end
-    return out_stats
+    return out_states
 end
 
 -- inputs = input_dim x T
--- grad_output = hiddin_dim x T
+-- grad_output = hiddin_dim x num_layers x T
 function LSTM:backward(inputs, grad_outputs)
     local size = inputs:size(2)
     local input_grads = torch.Tensor(inputs:size(1), inputs:size(2))
@@ -129,11 +162,7 @@ function LSTM:backward(inputs, grad_outputs)
         local input = inputs[{{},t}]
         local cell = self.cells[self.depth]
         -- get gradient of the output (2nd argurment)
-        local grad_output = grad_outputs[{{},t}]
-        -- get gradients of the t+1 cell (one time step forward)
-        local grads = {self.gradInput[2], self.gradInput[3]}
-        -- add output gradient to the hidden state gradients
-        grads[2]:add(grad_output)
+        local grad_output = grad_outputs[{{},{},t}]        
         -- recover previous states (t-1)
         local prev_output
         if self.depth > 1 then
@@ -141,10 +170,29 @@ function LSTM:backward(inputs, grad_outputs)
         else
             prev_output = self.init_values
         end
-        -- compute gradients of the input and keep it for the next iteration (used:132)
-        self.gradInput = cell:backward({input, prev_output[1], prev_output[2]}, grads)
+        local prev_c = prev_output[1]
+        local prev_h = prev_output[2]
+        -- get gradients of the t+1 cell (previous iteration)
+        local grad_c = self.grad_input[2]
+        local grad_h = self.grad_input[3]
+        if self.num_layers == 1 then
+            prev_c = {prev_c}
+            prev_h = {prev_h}
+        end
+        -- add output gradient to the hidden state gradients
+        for i = 1, self.num_layers do
+            grad_h[i]:add(grad_output[{{},i}])
+        end
+        local grads
+        if self.num_layers == 1 then
+            grads = {grad_c[1], grad_h[1]}
+        else
+            grads = {grad_c, grad_h}
+        end
+        -- compute gradients of the input and keep it for the next iteration
+        self.grad_input = cell:backward({input, prev_c, prev_h}, grads)
         -- keep the gradient for returning
-        input_grads[{{},t}] = self.gradInput[1]
+        input_grads[{{},t}] = self.grad_input[1]
         -- go back one step
         self.depth = self.depth - 1
     end
@@ -164,12 +212,12 @@ end
 -- reset depth of the network and all gradients to zero
 function LSTM:forget()
   self.depth = 0
-  for i = 1, #self.gradInput do
-    local gradInput = self.gradInput[i]
-    if type(gradInput) == 'table' then
-      for _, t in pairs(gradInput) do t:zero() end
+  for i = 1, #self.grad_input do
+    local grad_input = self.grad_input[i]
+    if type(grad_input) == 'table' then
+      for _, t in pairs(grad_input) do t:zero() end
     else
-      self.gradInput[i]:zero()
+      self.grad_input[i]:zero()
     end
   end
 end
