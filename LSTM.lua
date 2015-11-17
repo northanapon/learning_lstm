@@ -20,7 +20,7 @@ function LSTM:__init(config)
     self.input_dim = config.input_dim
     self.hidden_dim = config.hidden_dim
     self.num_layers = config.num_layers
-    
+    self.batch_size = 1
     -- create master cell (all cells will share master cell's params)
     self.master_cell = self:new_cell()
     -- depth to keep track of current state
@@ -29,28 +29,47 @@ function LSTM:__init(config)
     self.cells = {} 
     
     -- Setting initial values
-    local c_init, h_init, c_grad, h_grad
+    local c_grad, h_grad
     if self.num_layers == 1 then
-        c_init = torch.zeros(self.hidden_dim)
-        h_init = torch.zeros(self.hidden_dim)
         c_grad = {torch.zeros(self.hidden_dim)}
         h_grad = {torch.zeros(self.hidden_dim)}
     else
-        c_init, h_init, c_grad, h_grad = {}, {}, {}, {}
+        c_grad, h_grad = {}, {}
         for l = 1,self.num_layers do
-            c_init[l] = torch.zeros(self.hidden_dim)
-            h_init[l] = torch.zeros(self.hidden_dim)
             c_grad[l] = torch.zeros(self.hidden_dim)
             h_grad[l] = torch.zeros(self.hidden_dim)
         end
     end
+    self:init_states(self.batch_size)
+end
+
+function LSTM:init_states(batch_size)
+    if self.batch_size == batch_size and self.init_values then
+        return self.init_values
+    end
+    local c_init, h_init, c_grad, h_grad
+    if self.num_layers == 1 then
+        c_init = torch.zeros(batch_size, self.hidden_dim)
+        h_init = torch.zeros(batch_size, self.hidden_dim)
+        c_grad = {torch.zeros(batch_size, self.hidden_dim)}
+        h_grad = {torch.zeros(batch_size, self.hidden_dim)}
+    else
+        c_init, h_init, c_grad, h_grad = {}, {}, {}, {}
+        for l = 1,self.num_layers do
+            c_init[l] = torch.zeros(batch_size, self.hidden_dim)
+            h_init[l] = torch.zeros(batch_size, self.hidden_dim)
+            c_grad[l] = torch.zeros(batch_size, self.hidden_dim)
+            h_grad[l] = torch.zeros(batch_size, self.hidden_dim)
+        end
+    end
     self.init_values = {c_init, h_init}
-    -- grad_input for backward prob
     self.grad_input = {
-        torch.zeros(self.input_dim),
+        torch.zeros(batch_size, self.input_dim),
         c_grad,
         h_grad
     }
+    self.batch_size = batch_size
+    return self.init_values
 end
     
 function LSTM:new_cell()
@@ -72,17 +91,18 @@ function LSTM:new_cell()
         local h2h = nn.Linear(self.hidden_dim, 4*self.hidden_dim)(h_l_p) -- W_h * h_{t-1}{l} + b_h  
         -- preactivations for i_t, f_t, o_t, c_in_t (update)
         local preacts = nn.CAddTable()({i2h, h2h}) -- i2h + h2h
-    
-        -- direction of Narrow = 1 (column vector input)
+
+        -- direction of Narrow = 2 (row vector input)
         -- nonlinear:
         --     input, forget, and output gates get Sigmoid
         --     state update gets Tanh
-        local all_gates = nn.Sigmoid()(nn.Narrow(1, 1, 3*self.hidden_dim)(preacts)) 
-        local update = nn.Tanh()(nn.Narrow(1, 3*self.hidden_dim + 1, self.hidden_dim)(preacts))
+        local direction = 2
+        local all_gates = nn.Sigmoid()(nn.Narrow(direction, 1, 3*self.hidden_dim)(preacts)) 
+        local update = nn.Tanh()(nn.Narrow(direction, 3*self.hidden_dim + 1, self.hidden_dim)(preacts))
         -- split gates into their variables
-        local i_gate = nn.Narrow(1, 1, self.hidden_dim)(all_gates)
-        local f_gate = nn.Narrow(1, self.hidden_dim + 1, self.hidden_dim)(all_gates)
-        local o_gate = nn.Narrow(1, 2 * self.hidden_dim + 1, self.hidden_dim)(all_gates)
+        local i_gate = nn.Narrow(direction, 1, self.hidden_dim)(all_gates)
+        local f_gate = nn.Narrow(direction, self.hidden_dim + 1, self.hidden_dim)(all_gates)
+        local o_gate = nn.Narrow(direction, 2 * self.hidden_dim + 1, self.hidden_dim)(all_gates)
         -- new state, c_{t}{l} = f_t .* c_{t-1}{l} + i_t .* c_in_t
         c[l] = nn.CAddTable()({
                 nn.CMulTable()({f_gate, c_l_p}),
@@ -106,14 +126,21 @@ function LSTM:new_cell()
     return cell
 end
 
--- inputs: input_dim x T
--- outputs: hidden_dim X num_layers X T
+-- args:
+---- inputs: tensor (num_inputs X input_dim x T)
+---- outputs: tensor (num_inputs X hidden_dim X num_layers X T)
+-- return:
+---- out_states: tensor (num_inputs X hidden_dim X num_layers X T)
 function LSTM:forward(inputs)
-    local size = inputs:size(2)
-    local out_states = torch.Tensor(self.hidden_dim, self.num_layers, size)
+    if #inputs:size() == 2 then
+        inputs = inputs:reshape(1,inputs:size()[1],inputs:size()[2])
+    end
+    local num_inputs = inputs:size(1)
+    local size = inputs:size(3)
+    local out_states = torch.Tensor(num_inputs, self.hidden_dim, self.num_layers, size)
     for t = 1, size do
         -- set up input and depth
-        local input = inputs[{{},t}]
+        local input = inputs[{{},{},t}]
         self.depth = self.depth + 1
         -- reuse/create cell for this time step
         local cell = self.cells[self.depth]
@@ -124,9 +151,13 @@ function LSTM:forward(inputs)
         -- get previous states
         local prev_output
         if self.depth > 1 then
+            if num_inputs ~= self.batch_size then
+                print("Input batch size changed from the previous sequences. Reset the sequence by :forget()")
+                return torch.Tensor()
+            end
             prev_output = self.cells[self.depth - 1].output
         else
-            prev_output = self.init_values
+            prev_output = self:init_states(num_inputs)
         end
         -- in case of 1 layer, the cell will output 2 tensors of c and h
         -- instead of 2 tables of tensors, so we need to wrap the table for c and h
@@ -141,47 +172,59 @@ function LSTM:forward(inputs)
         -- output
         self.output = outputs
         if self.num_layers == 1 then
-            out_states[{{},{},t}] = outputs[2]
+            out_states[{{},{},{},t}] = outputs[2]
         else
             for i=1,self.num_layers do
-                out_states[{{}, i, t}] = outputs[2][i]
+                out_states[{{},{}, i, t}] = outputs[2][i]
             end
         end
     end
     return out_states
 end
 
--- inputs = input_dim x T
--- grad_output = hiddin_dim x num_layers x T
+-- args:
+---- inputs: tensor (num_inputs X input_dim x T)
+---- grad_output: tensor (num_inputs X hiddin_dim X num_layers x T)
+-- return:
+---- input_grads: tensor (num_inputs X input_dim X T)
 function LSTM:backward(inputs, grad_outputs)
-    local size = inputs:size(2)
-    local input_grads = torch.Tensor(inputs:size(1), inputs:size(2))
+    if #inputs:size() == 2 then
+        inputs = inputs:reshape(1,inputs:size()[1],inputs:size()[2])
+    end
+    local num_inputs = inputs:size(1)
+    local size = inputs:size(3)
+    local input_grads = torch.Tensor(num_inputs, self.input_dim, size)
+    local g_size = grad_outputs:size()
+    if #g_size == 3 then
+        grad_outputs = grad_outputs:reshape(1, g_size[1], g_size[2], g_size[3])
+    end
     -- backward from last forwarded cell to the first one
     for t = size,1,-1 do
         -- get input and cell for current step
-        local input = inputs[{{},t}]
+        local input = inputs[{{},{},t}]
         local cell = self.cells[self.depth]
         -- get gradient of the output (2nd argurment)
-        local grad_output = grad_outputs[{{},{},t}]        
+        local grad_output = grad_outputs[{{},{},{},t}]        
         -- recover previous states (t-1)
         local prev_output
         if self.depth > 1 then
             prev_output = self.cells[self.depth - 1].output
         else
-            prev_output = self.init_values
+            prev_output = self:init_states(num_inputs)
         end
         local prev_c = prev_output[1]
         local prev_h = prev_output[2]
-        -- get gradients of the t+1 cell (previous iteration)
-        local grad_c = self.grad_input[2]
-        local grad_h = self.grad_input[3]
         if self.num_layers == 1 then
             prev_c = {prev_c}
             prev_h = {prev_h}
         end
+        
+        -- get gradients of the t+1 cell (previous iteration)
+        local grad_c = self.grad_input[2]
+        local grad_h = self.grad_input[3]
         -- add output gradient to the hidden state gradients
         for i = 1, self.num_layers do
-            grad_h[i]:add(grad_output[{{},i}])
+            grad_h[i]:add(grad_output[{{},{},i}])
         end
         local grads
         if self.num_layers == 1 then
@@ -192,7 +235,7 @@ function LSTM:backward(inputs, grad_outputs)
         -- compute gradients of the input and keep it for the next iteration
         self.grad_input = cell:backward({input, prev_c, prev_h}, grads)
         -- keep the gradient for returning
-        input_grads[{{},t}] = self.grad_input[1]
+        input_grads[{{},{},t}] = self.grad_input[1]
         -- go back one step
         self.depth = self.depth - 1
     end
