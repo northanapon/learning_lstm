@@ -127,20 +127,19 @@ function LSTM:new_cell()
 end
 
 -- args:
----- inputs: tensor (num_inputs X input_dim x T)
----- outputs: tensor (num_inputs X hidden_dim X num_layers X T)
+---- inputs: tensor (num_inputs X T X input_dim)
 -- return:
----- out_states: tensor (num_inputs X hidden_dim X num_layers X T)
+---- states: tensor (num_inputs X T X num_layers X hidden_dim)
 function LSTM:forward(inputs)
     if #inputs:size() == 2 then
         inputs = inputs:reshape(1,inputs:size()[1],inputs:size()[2])
     end
     local num_inputs = inputs:size(1)
-    local size = inputs:size(3)
-    local out_states = torch.Tensor(num_inputs, self.hidden_dim, self.num_layers, size)
+    local size = inputs:size(2)
+    local out_states = torch.Tensor(num_inputs, size, self.num_layers, self.hidden_dim)
     for t = 1, size do
         -- set up input and depth
-        local input = inputs[{{},{},t}]
+        local input = inputs[{{}, t, {}}]
         self.depth = self.depth + 1
         -- reuse/create cell for this time step
         local cell = self.cells[self.depth]
@@ -172,10 +171,10 @@ function LSTM:forward(inputs)
         -- output
         self.output = outputs
         if self.num_layers == 1 then
-            out_states[{{},{},{},t}] = outputs[2]
+            out_states[{{},t,{},{}}] = outputs[2]
         else
             for i=1,self.num_layers do
-                out_states[{{},{}, i, t}] = outputs[2][i]
+                out_states[{{}, t, i, {}}] = outputs[2][i]
             end
         end
     end
@@ -183,17 +182,17 @@ function LSTM:forward(inputs)
 end
 
 -- args:
----- inputs: tensor (num_inputs X input_dim x T)
----- grad_output: tensor (num_inputs X hiddin_dim X num_layers x T)
+---- inputs: tensor (num_inputs X T X input_dim)
+---- grad_output: tensor (num_inputs X T X num_layers X hiddin_dim)
 -- return:
----- input_grads: tensor (num_inputs X input_dim X T)
+---- input_grads: tensor (num_inputs X T X input_dim)
 function LSTM:backward(inputs, grad_outputs)
     if #inputs:size() == 2 then
         inputs = inputs:reshape(1,inputs:size()[1],inputs:size()[2])
     end
     local num_inputs = inputs:size(1)
-    local size = inputs:size(3)
-    local input_grads = torch.Tensor(num_inputs, self.input_dim, size)
+    local size = inputs:size(2)
+    local input_grads = torch.Tensor(num_inputs, size, self.input_dim)
     local g_size = grad_outputs:size()
     if #g_size == 3 then
         grad_outputs = grad_outputs:reshape(1, g_size[1], g_size[2], g_size[3])
@@ -201,10 +200,10 @@ function LSTM:backward(inputs, grad_outputs)
     -- backward from last forwarded cell to the first one
     for t = size,1,-1 do
         -- get input and cell for current step
-        local input = inputs[{{},{},t}]
+        local input = inputs[{{}, t, {}}]
         local cell = self.cells[self.depth]
         -- get gradient of the output (2nd argurment)
-        local grad_output = grad_outputs[{{},{},{},t}]        
+        local grad_output = grad_outputs[{{},t,{},{}}]        
         -- recover previous states (t-1)
         local prev_output
         if self.depth > 1 then
@@ -224,7 +223,7 @@ function LSTM:backward(inputs, grad_outputs)
         local grad_h = self.grad_input[3]
         -- add output gradient to the hidden state gradients
         for i = 1, self.num_layers do
-            grad_h[i]:add(grad_output[{{},{},i}])
+            grad_h[i]:add(grad_output[{{},i,{}}])
         end
         local grads
         if self.num_layers == 1 then
@@ -235,7 +234,7 @@ function LSTM:backward(inputs, grad_outputs)
         -- compute gradients of the input and keep it for the next iteration
         self.grad_input = cell:backward({input, prev_c, prev_h}, grads)
         -- keep the gradient for returning
-        input_grads[{{},{},t}] = self.grad_input[1]
+        input_grads[{{}, t, {}}] = self.grad_input[1]
         -- go back one step
         self.depth = self.depth - 1
     end

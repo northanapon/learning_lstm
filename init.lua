@@ -1,3 +1,8 @@
+require 'nn'
+require 'nngraph'
+
+lstm = {}
+
 lstm.utils = {}
 -- An important function to make recursive/recurrent neural network work.
 -- Copy (same pointer) all parameters from sharing unit to target unit
@@ -17,3 +22,5 @@ function lstm.utils.share_parameters(sharing, target)
         error('cannot share parameters of the argument type')
     end
 end
+
+include('LSTM.lua')
