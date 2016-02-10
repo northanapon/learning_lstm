@@ -1,3 +1,5 @@
+## Deprecated
+
 ### A basic LSTM network implementation
 This implementation followed [Adam Paszke's tutorial](http://apaszke.github.io/lstm-explained.html) and [StanfordNLP TreeLSTM](https://github.com/stanfordnlp/treelstm/blob/master/models/LSTM.lua). Tiny Shakespeare data is from [Karpathy's Char-rnn](https://github.com/karpathy/char-rnn).
 
